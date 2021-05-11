@@ -25,6 +25,9 @@
 #' @param bin_path A `list(character)`. A list giving the binary path of `vcftools`, `bcftools`,
 #'     `tabix` and `bgzip`.
 #' @param nb_cores A `numeric`. The number of CPUs to use. Default is `1`.
+#' @param clean_tmp_folder A `logical`. (default is `TRUE`). Do you want to remove the tmp folder ?
+#'     You may want to turn this param to `FALSE` in order to inspect or re-use filtered vcf or
+#'     the merged file not recoded...
 #'
 #' @return A genotype matrix coded NA, 1, or 2 (additive model), with variants in rows and
 #'     individuals in columns. The first column `var_id` is composed of variant's chromosome,
@@ -51,9 +54,11 @@ create_genotype_matrix <- function(
   bin_path = list(
     vcftools = "/usr/bin/vcftools",
     bcftools = "/usr/bin/bcftools",
+    bgzip = "/usr/bin/bgzip",
     tabix = "/usr/bin/tabix"
   ),
-  nb_cores = 1
+  nb_cores = 1,
+  clean_tmp_folder = TRUE
 ) {
 
   if (! all(c("id", "vcf_file") %in% colnames(sample_sheet))) {
@@ -108,44 +113,122 @@ create_genotype_matrix <- function(
           bin_path[["bcftools"]], "sort --output-type z --output-file", iout
         ))
       } else {
-        if (!is_gzvcf) {
-          system(paste(
-            bin_path[["bcftools"]], "sort --output-type z --output-file", iout, ivcf
-          ))
-        } else {
-          system(paste("cp", ivcf, iout))
-        }
+        system(paste(
+          bin_path[["bcftools"]], "sort --output-type z --output-file", iout, ivcf
+        ))
+        ## in gz or not, must be sorted --here
       }
-
       ## indexing vcf
       system(paste(bin_path[["tabix"]], "-f -p vcf", iout))
     })
   )
 
+  if (!is.null(chromosomes)) {
+    chromosomes_list <- paste0(chromosomes, collapse = ",")
+    message("[chromosomes] ", chromosomes_list, " selected for each vcf")
+    invisible(
+      parallel::mclapply(
+        X = sample_sheet$id,
+        mc.cores = min(nb_cores, nrow(sample_sheet)),
+        function(iid) {
+          iout <- file.path(output_tmp_dir, paste0(iid, "_tmp.vcf.gz"))
+          iout_chr <- file.path(output_tmp_dir, paste0(iid, "_tmpchr.vcf.gz"))
+          system(paste(
+            bin_path[["bcftools"]],
+            "view", iout,
+            "--regions",chromosomes_list, # Comma-separated list of regions
+            "-O z >", iout_chr
+          ))
+          system(paste(bin_path[["tabix"]], "-f -p vcf", iout_chr))
+        }
+      )
+    )
+  }
+  # if (!is.null(position)) {
+  #   ## --here filter position too in a file. why not? --regions-file
+  #   ## see http://samtools.github.io/bcftools/bcftools.html#common_options
+  # }
+
   ## merge vcf
-  vcfs_to_merge <- list.files(output_tmp_dir, pattern = "_tmp.vcf.gz$", full.names = TRUE)
+  message("Merge vcf")
+  # vcfs_to_merge <- list.files(output_tmp_dir, pattern = "_tmp.vcf.gz$", full.names = TRUE)
+  if (!is.null(chromosomes)) {
+    vcfs_to_merge <- list.files(output_tmp_dir, pattern = paste0("_tmpchr.vcf.gz$"), full.names = TRUE)
+  } else {
+    vcfs_to_merge <- list.files(output_tmp_dir, pattern = "_tmp.vcf.gz$", full.names = TRUE)
+  }
   merged_vcf <- file.path(output_directory, paste0(output_name, ".vcf.gz"))
-  cat(
-    vcfs_to_merge,
-    file = file.path(output_tmp_dir, "vcfs_to_merge.txt"), sep = "\n"
-  )
+
   if (length(vcfs_to_merge) > 1) {
-    system(paste(
-      bin_path[["bcftools"]],
-      "merge -m none",
-      "--file-list", file.path(output_tmp_dir, "vcfs_to_merge.txt"),
-      "-O z >", merged_vcf
-    ))
+    # cat(
+    #   vcfs_to_merge,
+    #   file = file.path(output_tmp_dir, "vcfs_to_merge.txt"), sep = "\n"
+    # )
+    # system(paste(
+    #   bin_path[["bcftools"]],
+    #   "merge -m none",
+    #   "--file-list", file.path(output_tmp_dir, "vcfs_to_merge.txt"),
+    #   "-O z >", merged_vcf
+    # ))
+
+    ## still error with file-list on test with >5000 samples to merge
+    ## https://github.com/samtools/bcftools/issues/329
+    ## even if ulimit is unlimited.
+    ## So idea is to split our list in batch of 2000 samples
+    nb_batch <- ceiling(length(vcfs_to_merge)/2000)
+    message(paste("Go for", nb_batch, "batchs"))
+    indice <- c(seq(1, length(vcfs_to_merge), by = 2000), length(vcfs_to_merge))
+    for (i in 1:nb_batch) {
+      message(">>> ", i)
+      indice_batchi <- (indice[i]+1):indice[i+1] ## (start+1:end) otherwise the final merge have borne duplicated
+      if (i == 1) indice_batchi <- indice[i]:indice[i+1]
+
+      data.table::fwrite(
+        x = data.table::data.table(vcfs_to_merge[indice_batchi]),
+        file = file.path(output_tmp_dir, paste0("list_vcf", i, ".txt")),
+        quote = FALSE,
+        row.names = FALSE, col.names = FALSE
+      )
+
+      merged_vcf_batchi <- file.path(output_tmp_dir, paste0(output_name, "batch", i, ".vcf.gz"))
+      system(paste(
+        bin_path[["bcftools"]],
+        "merge -m none --file-list", file.path(output_tmp_dir, paste0("list_vcf", i, ".txt")),
+        "-O z >", merged_vcf_batchi
+      ))
+      ## indexing vcf
+      system(paste(bin_path[["tabix"]], "-f -p vcf", merged_vcf_batchi))
+    }
+    if (nb_batch == 1) {
+      file.copy(from = merged_vcf_batchi, to = merged_vcf, overwrite = TRUE)
+    } else {
+      message("Gather batchs")
+      data.table::fwrite(
+        x = data.table::data.table(
+          file.path(output_tmp_dir, paste0(output_name, "batch", 1:nb_batch, ".vcf.gz"))
+        ),
+        file = file.path(output_tmp_dir, "list_vcf_all_batch.txt"),
+        quote = FALSE,
+        row.names = FALSE, col.names = FALSE
+      )
+      system(paste(
+        bin_path[["bcftools"]],
+        "merge -m none --file-list", file.path(output_tmp_dir, "list_vcf_all_batch.txt"),
+        "-O z >", merged_vcf
+      ))
+    }
   } else {
     file.copy(from = vcfs_to_merge, to = merged_vcf, overwrite = TRUE)
   }
 
   ## prepare raw matrix
+  message("[data.table::fread merged_vcf]")
   data.table::setDTthreads(threads = nb_cores)
   geno_mat <- data.table::fread(merged_vcf, header = TRUE, showProgress = FALSE)
-  if (!is.null(chromosomes)) {
-    geno_mat <- geno_mat[`#CHROM` %in% chromosomes]
-  }
+  # if (!is.null(chromosomes)) {
+  #   geno_mat <- geno_mat[`#CHROM` %in% chromosomes] ## --here ever done in bcftools step, for each vcf
+  # }
+  message("[geno_mat] nrow (n variants) = ", nrow(geno_mat))
   geno_mat <- geno_mat[, var_id := paste(`#CHROM`, POS, REF, ALT, sep = "_")]
   geno_mat <- geno_mat[, .SD, .SDcols = !`#CHROM`:FORMAT]
   geno_sep <- ifelse(grepl(".{1}/.{1}:", geno_mat[[1]][1]), "/", "|")
@@ -185,8 +268,7 @@ create_genotype_matrix <- function(
     file = file.path(output_directory, paste0(output_name, ".tsv.gz")),
     col.names = TRUE
   )
-
-  unlink(output_tmp_dir, recursive = TRUE)
+  if (clean_tmp_folder) unlink(output_tmp_dir, recursive = TRUE)
   invisible(geno_mat)
 }
 
@@ -274,6 +356,7 @@ check_genotype <- function(
 
     not_compressed <- !file.exists(file.path(compress_cov_directory, paste0(samples_ids, ".cov.compress")))
     if (any(not_compressed)) {
+      message(sum(not_compressed), " samples haven't their cov.compress")
       cat(paste(
         "Start compressing the coverage file for sample:",
         paste0(samples_ids[not_compressed], collapse = ", ")
